@@ -3,15 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
 
 	"github.com/manifoldco/promptui"
+	"github.com/samber/lo"
 	"golang.org/x/exp/slices"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -25,8 +29,9 @@ import (
 
 var (
 	formatJson     = flag.Bool("json", false, "JSON output format (default)")
-	formatProtobuf = flag.Bool("protobuf", false, "protobuf output format")
+	formatProtobuf = flag.Bool("protobuf", false, "base64-encoded protobuf output format")
 	listMessages   = flag.Bool("list", false, "list out available messages")
+	debug          = flag.Bool("debug", false, "print debug logs")
 )
 
 func main() {
@@ -70,6 +75,9 @@ func listAllMessages(files *protoregistry.Files) error {
 
 func realMain() error {
 	flag.Parse()
+	if !*debug {
+		log.Default().SetOutput(io.Discard)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -107,16 +115,9 @@ func realMain() error {
 		return err
 	}
 
-	dynamic := dynamicpb.NewMessage(messageDesc)
-
-	fields := messageDesc.Fields()
-	for i := 0; i < fields.Len(); i++ {
-		f := fields.Get(i)
-		value, err := getValue(ctx, f.Kind(), string(f.Name()))
-		if err != nil {
-			return err
-		}
-		dynamic.Set(f, value)
+	dynamic, err := interactivePopulateMessage(ctx, messageDesc)
+	if err != nil {
+		return err
 	}
 
 	a, err := anypb.New(dynamic)
@@ -137,6 +138,30 @@ func realMain() error {
 	}
 }
 
+func interactivePopulateMessage(ctx context.Context, desc protoreflect.MessageDescriptor) (*dynamicpb.Message, error) {
+	msg := dynamicpb.NewMessage(desc)
+
+	fields := desc.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		f := fields.Get(i)
+
+		oneOf, value, err := getValue(ctx, f)
+		switch {
+		case err != nil:
+			return nil, err
+
+		case value != nil:
+			msg.Set(f, *value)
+
+		case oneOf != nil:
+			oneOfField := fields.ByName(oneOf.field.Name())
+			msg.Set(oneOfField, oneOf.value)
+		}
+	}
+
+	return msg, nil
+}
+
 func writeFormatJson(a *anypb.Any) error {
 	opts := protojson.MarshalOptions{
 		EmitUnpopulated: true,
@@ -146,7 +171,7 @@ func writeFormatJson(a *anypb.Any) error {
 		return err
 	}
 
-	_, err = fmt.Fprintln(os.Stdout, string(written))
+	_, err = fmt.Fprint(os.Stdout, string(written))
 	return err
 }
 
@@ -156,7 +181,7 @@ func writeFormatProtobuf(a *anypb.Any) error {
 		return err
 	}
 
-	_, err = fmt.Fprintln(os.Stdout, written)
+	_, err = fmt.Fprintln(os.Stdout, base64.StdEncoding.EncodeToString(written))
 	return err
 }
 
@@ -178,48 +203,140 @@ func (m messageType) Descriptor() protoreflect.MessageDescriptor {
 
 var _ protoreflect.MessageType = new(messageType)
 
-func getValue(ctx context.Context, kind protoreflect.Kind, field string) (protoreflect.Value, error) {
-	value := make(chan protoreflect.Value)
-	errs := make(chan error)
+func getOneOfValue(ctx context.Context, oneOf protoreflect.OneofDescriptor) (protoreflect.FullName, protoreflect.Value, error) {
+	var fields []protoreflect.FieldDescriptor
 
-	innerGetValue := func(kind protoreflect.Kind, field string) (protoreflect.Value, error) {
-		switch kind {
-		case protoreflect.StringKind:
-			p := promptui.Prompt{
-				Label:  field,
-				Stdout: os.Stderr,
-			}
-			res, err := p.Run()
-			if err != nil {
-				return protoreflect.Value{}, err
-			}
+	for i := 0; i < oneOf.Fields().Len(); i++ {
+		fields = append(fields, oneOf.Fields().Get(i))
+	}
 
-			return protoreflect.ValueOf(res), nil
+	p := promptui.Select{
+		HideSelected: true,
+		Stdout:       os.Stderr,
+		Label:        "Choose oneof value",
+		Items: lo.Map(fields, func(field protoreflect.FieldDescriptor, _ int) string {
+			return string(field.Name())
+		}),
+	}
+	res, err := askPrompt(ctx, p)
+	if err != nil {
+		return "", protoreflect.Value{}, err
+	}
+
+	field := oneOf.Fields().ByName(protoreflect.Name(res))
+	if field == nil {
+		panic(fmt.Sprintf("PROGRAMMER ERROR: field %s not found", res))
+	}
+
+	msg, err := interactivePopulateMessage(ctx, field.Message())
+	if err != nil {
+		return "", protoreflect.Value{}, err
+	}
+	return field.FullName(), protoreflect.ValueOfMessage(msg), nil
+
+}
+
+func askPrompt[P interface {
+	promptui.Prompt | promptui.Select
+}](ctx context.Context, prompt P) (string, error) {
+	innerGet := func() (string, error) {
+		p := any(prompt)
+		switch p := p.(type) {
+		case promptui.Prompt:
+			return p.Run()
+
+		case promptui.Select:
+			_, res, err := p.Run()
+			return res, err
 
 		default:
-			return protoreflect.Value{}, fmt.Errorf("unexpected kind: %s", kind)
+			panic(fmt.Sprintf("unexpected prompt %T", p))
 		}
 	}
 
+	errs := make(chan error)
+	vals := make(chan string)
 	go func() {
-		v, err := innerGetValue(kind, field)
+		val, err := innerGet()
 		if err != nil {
 			errs <- err
 			return
 		}
-		value <- v
+		vals <- val
 	}()
 
 	select {
 	case <-ctx.Done():
-		return protoreflect.Value{}, ctx.Err()
+		return "", ctx.Err()
 
 	case err := <-errs:
-		return protoreflect.Value{}, err
+		return "", err
 
-	case v := <-value:
+	case v := <-vals:
 		return v, nil
 	}
+}
+
+// TODO: encapsulate this in some worker struct, or equivalent?
+var oneOfsPopulated = map[protoreflect.FullName]struct{}{}
+
+type oneOfRes struct {
+	field protoreflect.FullName
+	value protoreflect.Value
+}
+
+func getValue(ctx context.Context, field protoreflect.FieldDescriptor) (*oneOfRes, *protoreflect.Value, error) {
+	log.Printf("fetching value for field %s", field.FullName())
+
+	if oneOf := field.ContainingOneof(); oneOf != nil {
+		if _, ok := oneOfsPopulated[field.FullName()]; ok {
+			log.Printf("field is already set through oneof: %s", field.FullName())
+			return nil, nil, nil
+		}
+
+		oneOfField, value, err := getOneOfValue(ctx, oneOf)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// mark all fields belonging to this oneof as done
+		for i := 0; i < oneOf.Fields().Len(); i++ {
+			oneOfsPopulated[oneOf.Fields().Get(i).FullName()] = struct{}{}
+		}
+
+		return &oneOfRes{oneOfField, value}, nil, nil
+
+	}
+
+	switch field.Kind() {
+
+	// recursively create the inner message
+	case protoreflect.MessageKind:
+		msg, err := interactivePopulateMessage(ctx, field.Message())
+		if err != nil {
+			return nil, nil, err
+		}
+
+		v := protoreflect.ValueOfMessage(msg)
+		return nil, &v, nil
+
+	case protoreflect.StringKind:
+		p := promptui.Prompt{
+			Label:  field.FullName(),
+			Stdout: os.Stderr,
+		}
+		res, err := askPrompt(ctx, p)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		v := protoreflect.ValueOf(res)
+		return nil, &v, nil
+
+	default:
+		return nil, nil, fmt.Errorf("unexpected kind: %s", field.Kind())
+	}
+
 }
 
 func buildProtoSet(ctx context.Context) (*descriptorpb.FileDescriptorSet, error) {
