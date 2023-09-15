@@ -32,6 +32,7 @@ var (
 	formatProtobuf = flag.Bool("protobuf", false, "base64-encoded protobuf output format")
 	listMessages   = flag.Bool("list", false, "list out available messages")
 	debug          = flag.Bool("debug", false, "print debug logs")
+	input          = flag.String("input", ".", "'buf build' input")
 )
 
 func main() {
@@ -87,7 +88,7 @@ func realMain() error {
 		return usage("needs exactly one argument")
 	}
 
-	descriptorSet, err := buildProtoSet(ctx)
+	descriptorSet, err := buildProtoSet(ctx, *input)
 	if err != nil {
 		return err
 	}
@@ -339,9 +340,9 @@ func getValue(ctx context.Context, field protoreflect.FieldDescriptor) (*oneOfRe
 
 }
 
-func buildProtoSet(ctx context.Context) (*descriptorpb.FileDescriptorSet, error) {
+func buildProtoSet(ctx context.Context, input string) (*descriptorpb.FileDescriptorSet, error) {
 	var out, errOut bytes.Buffer
-	cmd := exec.CommandContext(ctx, "buf", "build", "-o", "-")
+	cmd := exec.CommandContext(ctx, "buf", "build", "-o", "-", input)
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
 
