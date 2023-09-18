@@ -33,6 +33,7 @@ var (
 	listMessages   = flag.Bool("list", false, "list out available messages")
 	debug          = flag.Bool("debug", false, "print debug logs")
 	input          = flag.String("input", ".", "'buf build' input")
+	from           = flag.String("from", "", "create Protobuf message from JSON input")
 )
 
 func main() {
@@ -116,14 +117,33 @@ func realMain() error {
 		return err
 	}
 
-	dynamic, err := interactivePopulateMessage(ctx, messageDesc)
-	if err != nil {
-		return err
-	}
+	a := new(anypb.Any)
 
-	a, err := anypb.New(dynamic)
-	if err != nil {
-		return err
+	switch {
+	case *from != "":
+		log.Printf("reading input from %s", *from)
+
+		read, err := os.ReadFile(*from)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", *from, err)
+		}
+
+		opts := protojson.UnmarshalOptions{
+			DiscardUnknown: true,
+		}
+		if err := opts.Unmarshal(read, a); err != nil {
+			return err
+		}
+
+	default:
+		dynamic, err := interactivePopulateMessage(ctx, messageDesc)
+		if err != nil {
+			return err
+		}
+		a, err = anypb.New(dynamic)
+		if err != nil {
+			return err
+		}
 	}
 
 	switch {
