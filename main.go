@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 
 	"github.com/manifoldco/promptui"
@@ -166,12 +168,24 @@ func interactivePopulateMessage(ctx context.Context, desc protoreflect.MessageDe
 	for i := 0; i < fields.Len(); i++ {
 		f := fields.Get(i)
 
+		if f.Kind() == protoreflect.MessageKind {
+			populate, err := askBool(ctx, fmt.Sprintf("Populate message %q? (optional)", string(f.FullName())))
+			if err != nil {
+				return nil, err
+			}
+			if !populate {
+				log.Printf("skipping %s", f.FullName())
+				continue
+			}
+		}
+
 		oneOf, value, err := getValue(ctx, f)
 		switch {
 		case err != nil:
 			return nil, err
 
 		case value != nil:
+			log.Printf("assigning %s to %s", value, f)
 			msg.Set(f, *value)
 
 		case oneOf != nil:
@@ -306,6 +320,54 @@ type oneOfRes struct {
 	value protoreflect.Value
 }
 
+func askBool(ctx context.Context, field string) (bool, error) {
+	p := promptui.Select{
+		Label:  field,
+		Stdout: os.Stderr,
+		Items:  []string{"true", "false"},
+	}
+
+	res, err := askPrompt(ctx, p)
+	if err != nil {
+		return false, err
+	}
+
+	parsed, err := strconv.ParseBool(res)
+	if err != nil {
+		return false, err
+	}
+
+	return parsed, nil
+}
+
+func floatPrompt(field string) promptui.Prompt {
+	return promptui.Prompt{
+		Label:  field,
+		Stdout: os.Stderr,
+		Validate: func(s string) error {
+			_, err := strconv.ParseFloat(s, 64)
+			if err != nil {
+				return fmt.Errorf("%q is not a valid float", s)
+			}
+			return nil
+		},
+	}
+}
+
+func intPrompt(field string) promptui.Prompt {
+	return promptui.Prompt{
+		Label:  field,
+		Stdout: os.Stderr,
+		Validate: func(s string) error {
+			_, err := strconv.Atoi(s)
+			if err != nil {
+				return fmt.Errorf("%q is not a valid int", s)
+			}
+			return nil
+		},
+	}
+}
+
 func getValue(ctx context.Context, field protoreflect.FieldDescriptor) (*oneOfRes, *protoreflect.Value, error) {
 	log.Printf("fetching value for field %s", field.FullName())
 
@@ -339,6 +401,128 @@ func getValue(ctx context.Context, field protoreflect.FieldDescriptor) (*oneOfRe
 		}
 
 		v := protoreflect.ValueOfMessage(msg)
+		return nil, &v, nil
+
+	case protoreflect.BoolKind:
+		parsed, err := askBool(ctx, string(field.FullName()))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		v := protoreflect.ValueOfBool(parsed)
+		return nil, &v, nil
+
+	case protoreflect.Uint32Kind:
+		res, err := askPrompt(ctx, intPrompt(string(field.FullName())))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		parsed, err := strconv.Atoi(res)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		v := protoreflect.ValueOfUint32(uint32(parsed))
+		return nil, &v, nil
+
+	case protoreflect.Int32Kind:
+		res, err := askPrompt(ctx, intPrompt(string(field.FullName())))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		parsed, err := strconv.Atoi(res)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		v := protoreflect.ValueOfInt32(int32(parsed))
+		return nil, &v, nil
+
+	case protoreflect.Int64Kind:
+		res, err := askPrompt(ctx, intPrompt(string(field.FullName())))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		parsed, err := strconv.Atoi(res)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		v := protoreflect.ValueOfInt64(int64(parsed))
+		return nil, &v, nil
+
+	case protoreflect.FloatKind:
+		res, err := askPrompt(ctx, floatPrompt(string(field.FullName())))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		parsed, err := strconv.ParseFloat(res, 32)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		v := protoreflect.ValueOfFloat32(float32(parsed))
+		return nil, &v, nil
+
+	case protoreflect.DoubleKind:
+		res, err := askPrompt(ctx, floatPrompt(string(field.FullName())))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		parsed, err := strconv.ParseFloat(res, 64)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		v := protoreflect.ValueOfFloat64(parsed)
+		return nil, &v, nil
+
+	case protoreflect.EnumKind:
+		values := field.Enum().Values()
+		var allEnumValues []string
+		for i := 0; i < values.Len(); i++ {
+			allEnumValues = append(allEnumValues, string(values.Get(i).Name()))
+		}
+		p := promptui.Select{
+			Label:  field.FullName(),
+			Stdout: os.Stderr,
+			Items:  allEnumValues,
+		}
+
+		res, err := askPrompt(ctx, p)
+		if err != nil {
+			return nil, nil, err
+		}
+		enumValue := values.ByName(protoreflect.Name(res))
+		if enumValue == nil {
+			return nil, nil, fmt.Errorf("unknown enum: %s", res)
+		}
+
+		v := protoreflect.ValueOfEnum(enumValue.Number())
+		return nil, &v, nil
+
+	case protoreflect.BytesKind:
+		p := promptui.Prompt{
+			Label:  fmt.Sprintf("%s (hex)", field.FullName()),
+			Stdout: os.Stderr,
+		}
+
+		res, err := askPrompt(ctx, p)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		decoded, err := hex.DecodeString(res)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		v := protoreflect.ValueOfBytes(decoded)
 		return nil, &v, nil
 
 	case protoreflect.StringKind:
