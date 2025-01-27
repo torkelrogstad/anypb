@@ -35,7 +35,7 @@ var (
 	listMessages   = flag.Bool("list", false, "list out available messages")
 	debug          = flag.Bool("debug", false, "print debug logs")
 	input          = flag.String("input", ".", "'buf build' input")
-	from           = flag.String("from", "", "create Protobuf message from JSON input")
+	from           = flag.String("from", "", "Create Protobuf message from JSON input. '-' to read from stdin, otherwise a file path")
 )
 
 func main() {
@@ -107,7 +107,7 @@ func realMain() error {
 
 	desc, err := files.FindDescriptorByName(protoreflect.FullName(fullyQualified))
 	if err != nil {
-		return err
+		return fmt.Errorf("find %q: %w", fullyQualified, err)
 	}
 
 	messageDesc, ok := desc.(protoreflect.MessageDescriptor)
@@ -122,19 +122,45 @@ func realMain() error {
 	a := new(anypb.Any)
 
 	switch {
+	case *from == "-":
+		log.Printf("reading input from stdin")
+
+		readCh := make(chan []byte)
+		readErrCh := make(chan error)
+		go func() {
+			read, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				readErrCh <- err
+				return
+			}
+			readCh <- read
+		}()
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("read JSON from stdin: %w", ctx.Err())
+
+		case err := <-readErrCh:
+			return fmt.Errorf("read JSON from stdin: %w", err)
+
+		case read := <-readCh:
+			a, err = unmarshalJson(messageDesc, string(read))
+			if err != nil {
+				return fmt.Errorf("unmarshal JSON from stdin: %w", err)
+			}
+		}
+
 	case *from != "":
-		log.Printf("reading input from %s", *from)
+		log.Printf("reading input from path %q", *from)
 
 		read, err := os.ReadFile(*from)
 		if err != nil {
-			return fmt.Errorf("read %s: %w", *from, err)
+			return fmt.Errorf("read file path %q: %w", *from, err)
 		}
 
-		opts := protojson.UnmarshalOptions{
-			DiscardUnknown: true,
-		}
-		if err := opts.Unmarshal(read, a); err != nil {
-			return err
+		a, err = unmarshalJson(messageDesc, string(read))
+		if err != nil {
+			return fmt.Errorf("unmarshal JSON from file path %q: %w", *from, err)
 		}
 
 	default:
@@ -560,4 +586,19 @@ func buildProtoSet(ctx context.Context, input string) (*descriptorpb.FileDescrip
 	}
 
 	return &fs, nil
+}
+
+func unmarshalJson(desc protoreflect.MessageDescriptor, json string) (*anypb.Any, error) {
+	typ, err := protoregistry.GlobalTypes.FindMessageByName(desc.FullName())
+	if err != nil {
+		return nil, err
+	}
+
+	msg := typ.New().Interface()
+	opts := protojson.UnmarshalOptions{}
+	if err := opts.Unmarshal([]byte(json), msg); err != nil {
+		return nil, err
+	}
+
+	return anypb.New(msg)
 }
